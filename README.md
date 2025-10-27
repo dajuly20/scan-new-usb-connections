@@ -141,7 +141,26 @@ sudo apt install zenity -y
 - ✅ Activity-Log mit Zeitstempel
 - ✅ Mount-Point Erkennung für Storage-Geräte
 
+## 📄 Lizenz
+
+Dieses Projekt steht unter der **Beerware License** 🍺
+
+```
+"THE BEER-WARE LICENSE" (Revision 42):
+<dajuly20@github.com> wrote this file. As long as you retain this notice you
+can do whatever you want with this stuff. If we meet some day, and you think
+this stuff is worth it, you can buy me a beer in return.
+```
+
+**Das bedeutet:**
+- ✅ Du kannst mit dieser Software machen was du willst
+- 🍺 Wenn sie dir gefällt, schuldest du dem Autor ein Bier
+- 🤝 Falls wir uns mal treffen und du denkst es war das wert, gib mir ein Bier aus
+- 🎉 Das war's! Keine anderen Verpflichtungen oder Beschränkungen
+
 ---
 
 **Entwickelt für BashScripts Repository**  
 *Optimiert für Ubuntu/Debian-basierte Systeme*
+
+**Prost! 🍻**

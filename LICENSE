@@ -1,0 +1,35 @@
+/*
+ * ----------------------------------------------------------------------------
+ * "THE BEER-WARE LICENSE" (Revision 42):
+ * <dajuly20@github.com> wrote this file. As long as you retain this notice you
+ * can do whatever you want with this stuff. If we meet some day, and you think
+ * this stuff is worth it, you can buy me a beer in return.
+ * 
+ * Julian (dajuly20)
+ * ----------------------------------------------------------------------------
+ */
+
+USB Connection Scanner - Beerware License
+
+This software is provided under the "Beerware License". This means:
+
+1. You can do whatever you want with this software
+2. If you use it and like it, you owe the author a beer 🍺
+3. If we ever meet and you think this software was worth it, buy me a beer
+4. That's it! No other obligations or restrictions
+
+The original Beerware license was created by Poul-Henning Kamp.
+
+This USB Connection Scanner includes:
+- Real-time USB device monitoring
+- Detailed device information (USB standard, speed, class, driver)
+- Kernel device detection (/dev/sr0, /dev/sda, etc.)
+- GUI and CLI modes
+- Activity logging with timestamps
+
+Enjoy responsibly! 🍻
+
+---
+
+For more information about the Beerware License, visit:
+https://en.wikipedia.org/wiki/Beerware
