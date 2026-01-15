@@ -333,24 +333,14 @@ function show_help() {
 
 # Haupt-Eingabebehandlung
 case "${1:-}" in
-    --watch-cli)
-        trap 'echo ""; echo "🛑 USB-Watcher beendet um $(date '+%H:%M:%S')"; exit 0' INT
-        usb_watcher_cli
-        ;;
     --list-cli)
         show_usb_list_cli
         ;;
     --help|-h|help)
         show_help
         ;;
-    *)
-        echo "🔍 USB-Watcher - Einfache Version"
-        echo "=================================="
-        echo ""
-        echo "Verwenden Sie --help für alle Optionen"
-        echo ""
-        echo "Schnellstart:"
-        echo "  $0 --watch-cli     # USB-Überwachung starten"
-        echo "  $0 --list-cli      # USB-Geräte auflisten"
+    --watch-cli|*)
+        trap 'echo ""; echo "🛑 USB-Watcher beendet um $(date '+%H:%M:%S')"; exit 0' INT
+        usb_watcher_cli
         ;;
 esac

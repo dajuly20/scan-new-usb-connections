@@ -17,22 +17,36 @@ Ein fortschrittliches Tool zur Überwachung und Analyse von USB-Geräte-Verbindu
 
 ## 📁 Dateien
 
-- `scanusbconnections` - Hauptscript (empfohlen)
-- `usb_watcher_simple.sh` - Vereinfachte Version 
+- `scanusbconnections` - Hauptscript (CLI)
 - `usb_watcher_gui.sh` - GUI-Version mit Zenity
+
+## 📦 Installation
+
+```bash
+# Schnelle Installation
+./install.sh
+
+# Oder manuell
+sudo make install
+
+# Deinstallation
+sudo make uninstall
+```
+
+Nach der Installation kann `scanusbconnections` systemweit aufgerufen werden.
 
 ## 🛠️ Verwendung
 
 ### Schnellstart
 ```bash
+# USB-Überwachung starten (Standard)
+./scanusbconnections
+
 # USB-Geräte auflisten
 ./scanusbconnections --list-cli
 
-# USB-Überwachung starten (Terminal)
-./scanusbconnections --watch-cli
-
 # GUI-Version starten
-./scanusbconnections --gui
+./usb_watcher_gui.sh --gui
 ```
 
 ### Alle Parameter
@@ -41,9 +55,9 @@ Ein fortschrittliches Tool zur Überwachung und Analyse von USB-Geräte-Verbindu
 ```
 
 **Verfügbare Optionen:**
+- (ohne Parameter) - Startet Echtzeit-Überwachung im Terminal (Standard)
 - `--list-cli` - Zeigt alle aktuell angeschlossenen USB-Geräte
 - `--watch-cli` - Startet Echtzeit-Überwachung im Terminal
-- `--gui` - Startet grafische Benutzeroberfläche
 - `--help` - Zeigt Hilfe-Information
 
 ## 📋 Beispiel-Ausgabe
