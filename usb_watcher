@@ -1,0 +1,589 @@
+#!/usr/bin/env python3
+"""USB Watcher - Monitor USB device connections in CLI or GUI mode."""
+
+import subprocess
+import time
+import threading
+import signal
+import sys
+import os
+import re
+from datetime import datetime
+from queue import Queue, Empty
+
+# --- Constants (defined once) ---
+LOG_FILE = "/tmp/usb_watcher.log"
+PID_FILE = "/tmp/usb_watcher.pid"
+POLL_INTERVAL = 2  # seconds
+
+# Tab-separated column headers
+COL_HEADER = "#\tGerät\tBus\tStandard\tSpeed\tKlasse\tTreiber"
+COL_SEP = "-\t-----\t---\t--------\t-----\t------\t-------"
+
+# --- USB speed mapping ---
+SPEED_MAP = {
+    "1.5":   ("USB 1.0 Low Speed",    "1.5 Mbit/s"),
+    "12":    ("USB 1.1 Full Speed",    "12 Mbit/s"),
+    "480":   ("USB 2.0 High Speed",    "480 Mbit/s"),
+    "5000":  ("USB 3.0 SuperSpeed",    "5 Gbit/s"),
+    "10000": ("USB 3.1 SuperSpeed+",   "10 Gbit/s"),
+    "20000": ("USB 3.2 SuperSpeed+",   "20 Gbit/s"),
+}
+
+BCDUSB_MAP = {
+    "1.0": ("USB 1.0 Low Speed",      "1.5 Mbit/s"),
+    "1.1": ("USB 1.1 Full Speed",     "12 Mbit/s"),
+    "2.0": ("USB 2.0 High Speed",     "480 Mbit/s"),
+    "3.0": ("USB 3.0 SuperSpeed",     "5 Gbit/s"),
+    "3.1": ("USB 3.1 SuperSpeed+",    "10 Gbit/s"),
+    "3.2": ("USB 3.2 SuperSpeed+",    "20 Gbit/s"),
+}
+
+
+def run_cmd(cmd, timeout=5):
+    """Run a shell command and return stdout."""
+    try:
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+        return r.stdout.strip()
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return ""
+
+
+def get_lsusb_devices():
+    """Parse lsusb output into a set of (bus, device, id, name) tuples."""
+    devices = set()
+    out = run_cmd("lsusb")
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        m = re.match(r"Bus (\d+) Device (\d+): ID ([0-9a-f:]+)\s+(.*)", line)
+        if m:
+            devices.add((m.group(1), m.group(2), m.group(3), m.group(4)))
+    return devices
+
+
+def get_usb_speed(bus, device):
+    """Get USB speed from sysfs."""
+    for pattern in [f"/sys/bus/usb/devices/{bus}-{device}/speed",
+                    f"/sys/bus/usb/devices/{int(bus)}-{int(device)}/speed"]:
+        try:
+            with open(pattern) as f:
+                speed = f.read().strip()
+                if speed in SPEED_MAP:
+                    return SPEED_MAP[speed]
+                return (f"USB ({speed} Mbit/s)", f"{speed} Mbit/s")
+        except (FileNotFoundError, PermissionError):
+            continue
+    return None
+
+
+def get_usb_detailed_info(bus, device, vendor_id_product):
+    """Get detailed USB info via lsusb -v."""
+    standard = "USB Unbekannt"
+    speed = "Unbekannt"
+    device_class = "Unbekannt"
+    driver = "Kein Treiber"
+
+    sysfs_speed = get_usb_speed(bus, device)
+    if sysfs_speed:
+        standard, speed = sysfs_speed
+
+    detailed = run_cmd(f"lsusb -v -d {vendor_id_product} 2>/dev/null | head -50")
+    if detailed:
+        if not sysfs_speed:
+            m = re.search(r"bcdUSB\s+(\d+\.\d+)", detailed)
+            if m:
+                bcd = m.group(1)
+                for prefix, val in BCDUSB_MAP.items():
+                    if bcd.startswith(prefix):
+                        standard, speed = val
+                        break
+
+        m = re.search(r"bDeviceClass\s+\d+\s+(.*)", detailed)
+        if m and m.group(1).strip():
+            device_class = m.group(1).strip().split()[0]
+        if device_class in ("Unbekannt", "(Defined"):
+            m = re.search(r"bInterfaceClass\s+\d+\s+(.*)", detailed)
+            if m and m.group(1).strip():
+                device_class = m.group(1).strip().split()[0]
+
+    tree = run_cmd("lsusb -t")
+    if tree:
+        dev_num = int(device)
+        for line in tree.splitlines():
+            m_dev = re.search(rf"Dev\s+0*{dev_num}\b", line)
+            if m_dev:
+                m_drv = re.search(r"Driver=(\S+)", line)
+                if m_drv and m_drv.group(1) not in ("[none]", "hub/4p", "hub/5p", "hub/6p"):
+                    drv = m_drv.group(1).rstrip(",")
+                    if not drv.startswith("hub/"):
+                        driver = drv
+                m_cls = re.search(r"Class=([^,]+)", line)
+                if m_cls and device_class in ("Unbekannt", "(Defined", "[unknown]"):
+                    device_class = m_cls.group(1).strip()
+                break
+
+    return standard, speed, device_class, driver
+
+
+def get_kernel_device_info(vendor_product):
+    """Check dmesg for recently attached devices (sr, sd, sg)."""
+    logs = run_cmd("dmesg | tail -50")
+    if not logs:
+        return ""
+
+    info_parts = []
+
+    sr_match = re.findall(r"(sr\d+).*scsi.*CD-ROM", logs)
+    if sr_match:
+        sr_dev = sr_match[-1]
+        if "BD-RE" in logs:
+            info_parts.append(f"\U0001f4c0 /dev/{sr_dev} (Blu-ray)")
+        elif "DVD" in logs:
+            info_parts.append(f"\U0001f4c0 /dev/{sr_dev} (DVD)")
+        else:
+            info_parts.append(f"\U0001f4c0 /dev/{sr_dev} (CD-ROM)")
+
+    sd_match = re.findall(r"(sd[a-z]\d*).*Attached", logs)
+    if sd_match and not sr_match:
+        sd_dev = sd_match[-1]
+        mount_info = run_cmd(f"mount | grep '/dev/{sd_dev}' | head -1")
+        mount_str = ""
+        if mount_info:
+            m = re.search(r"on\s+(\S+)", mount_info)
+            if m:
+                mount_str = f" \u2192 {m.group(1)}"
+        info_parts.append(f"\U0001f4be /dev/{sd_dev}{mount_str}")
+
+    sg_match = re.findall(r"(sg\d+).*Attached", logs)
+    if sg_match:
+        sg_dev = sg_match[-1]
+        info_parts.append(f"\U0001f527 /dev/{sg_dev} (SCSI)")
+
+    return " | ".join(info_parts)
+
+
+def now():
+    return datetime.now().strftime("%H:%M:%S")
+
+
+def device_row(num, name, bus, dev, standard, speed, dev_class, driver):
+    """Format a device as a tab-separated row."""
+    return f"{num}\t{name}\t{bus}:{dev}\t{standard}\t{speed}\t{dev_class}\t{driver}"
+
+
+# ──────────────────────────────────────────────
+#  CLI functions
+# ──────────────────────────────────────────────
+
+def emit(text, log_file=None):
+    """Print text to stdout and optionally append to log file."""
+    print(text)
+    sys.stdout.flush()
+    if log_file:
+        try:
+            with open(log_file, "a") as f:
+                f.write(text + "\n")
+                f.flush()
+        except OSError:
+            pass
+
+
+def show_usb_list(log_file=None):
+    """Show all connected USB devices as a table."""
+    emit(f"\U0001f50d USB-Geräte Übersicht - {now()}", log_file)
+    emit("", log_file)
+    emit(COL_HEADER, log_file)
+    emit(COL_SEP, log_file)
+
+    devices = get_lsusb_devices()
+    if not devices:
+        emit("\u274c Keine USB-Geräte gefunden", log_file)
+        return
+
+    for i, (bus, dev, vid_pid, name) in enumerate(sorted(devices), 1):
+        standard, speed, dev_class, driver = get_usb_detailed_info(bus, dev, vid_pid)
+        emit(device_row(i, name, bus, dev, standard, speed, dev_class, driver), log_file)
+
+    emit("", log_file)
+    emit(f"\u2705 Insgesamt {len(devices)} USB-Geräte gefunden", log_file)
+
+
+def watch_usb(log_file=None, stop_event=None):
+    """Watch for USB changes. Runs until Ctrl+C or stop_event is set."""
+    emit(f"\U0001f50d USB-Watcher gestartet um {now()}", log_file)
+    emit(f"\U0001f4cb Überwache USB-Anschlüsse... (Ctrl+C zum Beenden)", log_file)
+    emit("", log_file)
+
+    # Show initial device list
+    emit(COL_HEADER, log_file)
+    emit(COL_SEP, log_file)
+    current = get_lsusb_devices()
+    for i, (bus, dev, vid_pid, name) in enumerate(sorted(current), 1):
+        standard, speed, dev_class, driver = get_usb_detailed_info(bus, dev, vid_pid)
+        emit(device_row(i, name, bus, dev, standard, speed, dev_class, driver), log_file)
+    emit("", log_file)
+    emit(f"\u2705 {len(current)} Geräte \u2014 warte auf Änderungen...", log_file)
+
+    while True:
+        if stop_event and stop_event.is_set():
+            break
+        time.sleep(POLL_INTERVAL)
+
+        new = get_lsusb_devices()
+        if new == current:
+            continue
+
+        added = new - current
+        removed = current - new
+
+        emit("", log_file)
+        emit(f"\u26a1 USB-Änderung erkannt um {now()}!", log_file)
+
+        if added:
+            emit("", log_file)
+            emit("\U0001f50c NEU ANGESCHLOSSEN:", log_file)
+            emit(f"  \t{'Gerät'}\t{'Bus'}\t{'Standard'}\t{'Speed'}\t{'Klasse'}\t{'Treiber'}", log_file)
+            for bus, dev, vid_pid, name in sorted(added):
+                time.sleep(1.5)
+                standard, speed, dev_class, driver = get_usb_detailed_info(bus, dev, vid_pid)
+                emit(f"\u2795\t{name}\t{bus}:{dev}\t{standard}\t{speed}\t{dev_class}\t{driver}", log_file)
+
+                kernel_info = get_kernel_device_info(name)
+                if kernel_info:
+                    emit(f"  \t\U0001f5a5\ufe0f  {kernel_info}", log_file)
+
+        if removed:
+            emit("", log_file)
+            emit("\u274c ENTFERNT:", log_file)
+            for bus, dev, vid_pid, name in sorted(removed):
+                emit(f"\u2796\t{name}\t{bus}:{dev}", log_file)
+
+        current = new
+        emit("", log_file)
+        emit(f"\U0001f4cb Weiter überwachen... ({now()})", log_file)
+
+
+# ──────────────────────────────────────────────
+#  GUI watcher (communicates via Queue)
+# ──────────────────────────────────────────────
+
+GUI_COLUMNS = ["#", "Gerät", "Bus", "Standard", "Speed", "Klasse", "Treiber"]
+
+
+def gui_watcher(msg_queue, stop_event):
+    """Watcher loop that sends structured messages to the GUI via Queue."""
+    def send(kind, data):
+        msg_queue.put((kind, data))
+
+    send("log", f"\U0001f50d USB-Watcher gestartet um {now()}")
+
+    # Initial device scan
+    current = get_lsusb_devices()
+    rows = []
+    for i, (bus, dev, vid_pid, name) in enumerate(sorted(current), 1):
+        standard, speed, dev_class, driver = get_usb_detailed_info(bus, dev, vid_pid)
+        rows.append([str(i), name, f"{bus}:{dev}", standard, speed, dev_class, driver])
+    send("devices", rows)
+    send("log", f"\u2705 {len(current)} Geräte — warte auf Änderungen...")
+
+    while not stop_event.is_set():
+        time.sleep(POLL_INTERVAL)
+
+        new = get_lsusb_devices()
+        if new == current:
+            continue
+
+        added = new - current
+        removed = current - new
+
+        send("log", f"\n\u26a1 USB-Änderung erkannt um {now()}!")
+
+        if added:
+            send("log", "\U0001f50c NEU ANGESCHLOSSEN:")
+            for bus, dev, vid_pid, name in sorted(added):
+                time.sleep(1.5)
+                standard, speed, dev_class, driver = get_usb_detailed_info(bus, dev, vid_pid)
+                send("log", f"  \u2795 {name}  ({standard}, {speed}, {dev_class}, {driver})")
+                kernel_info = get_kernel_device_info(name)
+                if kernel_info:
+                    send("log", f"     \U0001f5a5\ufe0f  {kernel_info}")
+
+        if removed:
+            send("log", "\u274c ENTFERNT:")
+            for bus, dev, vid_pid, name in sorted(removed):
+                send("log", f"  \u2796 {name}  ({bus}:{dev})")
+
+        current = new
+
+        # Rebuild full device table
+        rows = []
+        for i, (bus, dev, vid_pid, name) in enumerate(sorted(current), 1):
+            standard, speed, dev_class, driver = get_usb_detailed_info(bus, dev, vid_pid)
+            rows.append([str(i), name, f"{bus}:{dev}", standard, speed, dev_class, driver])
+        send("devices", rows)
+        send("log", f"\U0001f4cb {len(current)} Geräte — weiter überwachen...")
+
+
+# ──────────────────────────────────────────────
+#  GUI (PyQt6 / PyQt5 with fallback)
+# ──────────────────────────────────────────────
+
+def run_gui():
+    """Start the GUI with tray icon and persistent window."""
+    try:
+        from PyQt6.QtWidgets import (QApplication, QMainWindow, QPlainTextEdit,
+                                     QSystemTrayIcon, QMenu, QVBoxLayout, QHBoxLayout,
+                                     QWidget, QCheckBox, QPushButton, QTableWidget,
+                                     QTableWidgetItem, QHeaderView, QSplitter, QLabel)
+        from PyQt6.QtGui import QIcon, QFont, QAction, QTextCursor
+        from PyQt6.QtCore import QTimer, Qt
+        QT6 = True
+    except ImportError:
+        try:
+            from PyQt5.QtWidgets import (QApplication, QMainWindow, QPlainTextEdit,
+                                         QSystemTrayIcon, QMenu, QVBoxLayout, QHBoxLayout,
+                                         QWidget, QAction, QCheckBox, QPushButton,
+                                         QTableWidget, QTableWidgetItem, QHeaderView,
+                                         QSplitter, QLabel)
+            from PyQt5.QtGui import QIcon, QFont, QTextCursor
+            from PyQt5.QtCore import QTimer, Qt
+            QT6 = False
+        except ImportError:
+            print("\u274c PyQt6 oder PyQt5 wird benötigt!")
+            print("   Installieren mit: sudo apt install python3-pyqt6")
+            print("   Oder:             sudo apt install python3-pyqt5")
+            sys.exit(1)
+
+    msg_queue = Queue()
+    stop_event = threading.Event()
+
+    app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
+
+    # --- Font ---
+    font = QFont("Noto Sans Mono", 10)
+    font.setStyleHint(QFont.StyleHint.Monospace if QT6 else QFont.Monospace)
+
+    # --- Main window ---
+    win = QMainWindow()
+    win.setWindowTitle("USB Watcher")
+    win.setMinimumSize(1000, 600)
+
+    # --- Device table (top) ---
+    table = QTableWidget()
+    table.setColumnCount(len(GUI_COLUMNS))
+    table.setHorizontalHeaderLabels(GUI_COLUMNS)
+    table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers if QT6
+                          else QTableWidget.NoEditTriggers)
+    table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows if QT6
+                               else QTableWidget.SelectRows)
+    table.setAlternatingRowColors(True)
+    table.verticalHeader().setVisible(False)
+    table.setFont(font)
+    table.setStyleSheet(
+        "QTableWidget { background-color: #ffffff; color: #000000; gridline-color: #ddd; }"
+        "QTableWidget::item { padding: 2px 6px; }"
+        "QHeaderView::section { background-color: #f0f0f0; font-weight: bold;"
+        "  border: 1px solid #ccc; padding: 4px; }"
+    )
+
+    # Column sizing
+    header = table.horizontalHeader()
+    header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents if QT6
+                                else QHeaderView.ResizeToContents)  # #
+    header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch if QT6
+                                else QHeaderView.Stretch)  # Gerät
+    for col in range(2, len(GUI_COLUMNS)):
+        header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents if QT6
+                                    else QHeaderView.ResizeToContents)
+
+    # --- Event log (bottom) ---
+    log_label = QLabel("\U0001f4cb Event-Log")
+    log_label.setFont(font)
+
+    log_edit = QPlainTextEdit()
+    log_edit.setReadOnly(True)
+    log_edit.setFont(font)
+    log_edit.setMaximumBlockCount(500)
+    log_edit.setStyleSheet(
+        "QPlainTextEdit { background-color: #ffffff; color: #000000; }"
+    )
+
+    # --- Splitter: table top, log bottom ---
+    splitter = QSplitter(Qt.Orientation.Vertical if QT6 else Qt.Vertical)
+    splitter.addWidget(table)
+
+    log_container = QWidget()
+    log_layout = QVBoxLayout(log_container)
+    log_layout.setContentsMargins(0, 4, 0, 0)
+    log_layout.addWidget(log_label)
+    log_layout.addWidget(log_edit)
+    splitter.addWidget(log_container)
+    splitter.setSizes([350, 200])
+
+    # --- Bottom bar: checkbox + close button ---
+    bg_checkbox = QCheckBox("Hintergrund-Modus")
+    bg_checkbox.setChecked(True)
+    bg_checkbox.setToolTip("Aktiviert: Schließen versteckt das Fenster in den Tray\n"
+                           "Deaktiviert: Schließen beendet das Programm")
+
+    close_btn = QPushButton("Schließen")
+    close_btn.setFixedWidth(120)
+
+    bottom_bar = QHBoxLayout()
+    bottom_bar.addWidget(bg_checkbox)
+    bottom_bar.addStretch()
+    bottom_bar.addWidget(close_btn)
+
+    # --- Assemble layout ---
+    container = QWidget()
+    main_layout = QVBoxLayout(container)
+    main_layout.setContentsMargins(4, 4, 4, 4)
+    main_layout.addWidget(splitter)
+    main_layout.addLayout(bottom_bar)
+    win.setCentralWidget(container)
+
+    # --- Process queue messages ---
+    def process_queue():
+        while True:
+            try:
+                kind, data = msg_queue.get_nowait()
+            except Empty:
+                break
+
+            if kind == "devices":
+                table.setRowCount(len(data))
+                for row_idx, row_data in enumerate(data):
+                    for col_idx, value in enumerate(row_data):
+                        item = QTableWidgetItem(value)
+                        item.setFlags(item.flags() & ~(Qt.ItemFlag.ItemIsEditable if QT6
+                                                        else Qt.ItemIsEditable))
+                        table.setItem(row_idx, col_idx, item)
+
+            elif kind == "log":
+                log_edit.moveCursor(QTextCursor.MoveOperation.End if QT6
+                                    else QTextCursor.End)
+                log_edit.appendPlainText(data)
+                log_edit.moveCursor(QTextCursor.MoveOperation.End if QT6
+                                    else QTextCursor.End)
+
+    timer = QTimer()
+    timer.timeout.connect(process_queue)
+    timer.start(500)
+
+    # --- Tray icon ---
+    icon = QIcon.fromTheme("drive-removable-media-usb")
+    if icon.isNull():
+        icon = QIcon.fromTheme("media-removable")
+
+    tray = QSystemTrayIcon(icon, app)
+    tray.setToolTip("USB Watcher - Überwachung aktiv")
+
+    tray_menu = QMenu()
+    show_action = QAction("Fenster anzeigen", app)
+    quit_action = QAction("Beenden", app)
+
+    def show_window():
+        win.show()
+        win.raise_()
+        win.activateWindow()
+
+    def quit_app():
+        stop_event.set()
+        timer.stop()
+        tray.hide()
+        try:
+            os.remove(LOG_FILE)
+        except OSError:
+            pass
+        app.quit()
+
+    def close_or_hide():
+        if bg_checkbox.isChecked():
+            win.hide()
+        else:
+            quit_app()
+
+    close_btn.clicked.connect(close_or_hide)
+    show_action.triggered.connect(show_window)
+    quit_action.triggered.connect(quit_app)
+
+    tray_menu.addAction(show_action)
+    tray_menu.addSeparator()
+    tray_menu.addAction(quit_action)
+    tray.setContextMenu(tray_menu)
+
+    if QT6:
+        activate_reason = QSystemTrayIcon.ActivationReason.Trigger
+    else:
+        activate_reason = QSystemTrayIcon.Trigger
+    tray.activated.connect(lambda reason: show_window()
+                           if reason == activate_reason else None)
+    tray.show()
+
+    # Window close (X button) -> depends on checkbox
+    def close_event(event):
+        if bg_checkbox.isChecked():
+            event.ignore()
+            win.hide()
+        else:
+            quit_app()
+
+    win.closeEvent = close_event
+
+    # Start watcher in background
+    t = threading.Thread(target=gui_watcher, args=(msg_queue, stop_event), daemon=True)
+    t.start()
+
+    win.show()
+    sys.exit(app.exec() if QT6 else app.exec_())
+
+
+# ──────────────────────────────────────────────
+#  CLI entry point
+# ──────────────────────────────────────────────
+
+def show_help():
+    name = os.path.basename(sys.argv[0])
+    print(f"\U0001f50d USB Watcher - USB-Geräte Monitor")
+    print("=" * 50)
+    print()
+    print("\U0001f4cb VERFÜGBARE PARAMETER:")
+    print()
+    print(f"  {name}                Zeigt diese Hilfe (Standard)")
+    print(f"  {name} --watch        Startet USB-Überwachung im Terminal")
+    print(f"  {name} --list         Zeigt alle USB-Geräte im Terminal")
+    print(f"  {name} --gui          Startet GUI mit Tray-Icon")
+    print(f"  {name} --help         Zeigt diese Hilfe")
+    print()
+    print("\U0001f680 BEISPIELE:")
+    print(f"  {name} --watch        # USB-Watcher starten (CLI)")
+    print(f"  {name} --list         # USB-Geräte auflisten")
+    print(f"  {name} --gui          # GUI mit persistentem Fenster + Tray-Icon")
+    print()
+
+
+def main():
+    signal.signal(signal.SIGINT, lambda s, f: (print(f"\n\U0001f6d1 USB-Watcher beendet um {now()}"), sys.exit(0)))
+
+    arg = sys.argv[1] if len(sys.argv) > 1 else "--help"
+
+    if arg in ("--help", "-h"):
+        show_help()
+    elif arg == "--list":
+        show_usb_list()
+    elif arg == "--gui":
+        run_gui()
+    elif arg in ("--watch", "--watch-cli"):
+        watch_usb()
+    else:
+        print(f"\u274c Unbekannter Parameter: {arg}")
+        print()
+        show_help()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
