@@ -269,7 +269,7 @@ def watch_usb(log_file=None, stop_event=None):
 #  GUI watcher (communicates via Queue)
 # ──────────────────────────────────────────────
 
-GUI_COLUMNS = ["#", "Gerät", "Bus", "Standard", "Speed", "Klasse", "Treiber"]
+GUI_COLUMNS = ["#", "Timestamp", "Gerät", "Bus", "Standard", "Speed", "Klasse", "Treiber"]
 
 
 def gui_watcher(msg_queue, stop_event):
@@ -284,7 +284,7 @@ def gui_watcher(msg_queue, stop_event):
     rows = []
     for i, (bus, dev, vid_pid, name) in enumerate(sorted(current), 1):
         standard, speed, dev_class, driver = get_usb_detailed_info(bus, dev, vid_pid)
-        rows.append([str(i), name, f"{bus}:{dev}", standard, speed, dev_class, driver])
+        rows.append([str(i), now(), name, f"{bus}:{dev}", standard, speed, dev_class, driver])
     send("devices", rows)
     send("log", f"\u2705 {len(current)} Geräte — warte auf Änderungen...")
 
@@ -321,7 +321,7 @@ def gui_watcher(msg_queue, stop_event):
         rows = []
         for i, (bus, dev, vid_pid, name) in enumerate(sorted(current), 1):
             standard, speed, dev_class, driver = get_usb_detailed_info(bus, dev, vid_pid)
-            rows.append([str(i), name, f"{bus}:{dev}", standard, speed, dev_class, driver])
+            rows.append([str(i), now(), name, f"{bus}:{dev}", standard, speed, dev_class, driver])
         send("devices", rows)
         send("log", f"\U0001f4cb {len(current)} Geräte — weiter überwachen...")
 
@@ -337,7 +337,7 @@ def run_gui():
                                      QSystemTrayIcon, QMenu, QVBoxLayout, QHBoxLayout,
                                      QWidget, QCheckBox, QPushButton, QTableWidget,
                                      QTableWidgetItem, QHeaderView, QSplitter, QLabel)
-        from PyQt6.QtGui import QIcon, QFont, QAction, QTextCursor
+        from PyQt6.QtGui import QIcon, QFont, QAction
         from PyQt6.QtCore import QTimer, Qt
         QT6 = True
     except ImportError:
@@ -347,7 +347,7 @@ def run_gui():
                                          QWidget, QAction, QCheckBox, QPushButton,
                                          QTableWidget, QTableWidgetItem, QHeaderView,
                                          QSplitter, QLabel)
-            from PyQt5.QtGui import QIcon, QFont, QTextCursor
+            from PyQt5.QtGui import QIcon, QFont
             from PyQt5.QtCore import QTimer, Qt
             QT6 = False
         except ImportError:
@@ -391,13 +391,13 @@ def run_gui():
 
     # Column sizing
     header = table.horizontalHeader()
-    header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents if QT6
-                                else QHeaderView.ResizeToContents)  # #
-    header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch if QT6
-                                else QHeaderView.Stretch)  # Gerät
-    for col in range(2, len(GUI_COLUMNS)):
-        header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents if QT6
-                                    else QHeaderView.ResizeToContents)
+    RTC = QHeaderView.ResizeMode.ResizeToContents if QT6 else QHeaderView.ResizeToContents
+    STR = QHeaderView.ResizeMode.Stretch if QT6 else QHeaderView.Stretch
+    header.setSectionResizeMode(0, RTC)   # #
+    header.setSectionResizeMode(1, RTC)   # Timestamp
+    header.setSectionResizeMode(2, STR)   # Gerät (stretch)
+    for col in range(3, len(GUI_COLUMNS)):
+        header.setSectionResizeMode(col, RTC)
 
     # --- Event log (bottom) ---
     log_label = QLabel("\U0001f4cb Event-Log")
@@ -410,6 +410,12 @@ def run_gui():
     log_edit.setStyleSheet(
         "QPlainTextEdit { background-color: #ffffff; color: #000000; }"
     )
+    log_edit.document().setDocumentMargin(6)
+
+    def _on_log_range_changed(_, max_val):
+        if autoscroll_checkbox.isChecked():
+            log_edit.verticalScrollBar().setValue(max_val)
+    log_edit.verticalScrollBar().rangeChanged.connect(_on_log_range_changed)
 
     # --- Splitter: table top, log bottom ---
     splitter = QSplitter(Qt.Orientation.Vertical if QT6 else Qt.Vertical)
@@ -421,19 +427,26 @@ def run_gui():
     log_layout.addWidget(log_label)
     log_layout.addWidget(log_edit)
     splitter.addWidget(log_container)
-    splitter.setSizes([350, 200])
+    splitter.setStretchFactor(0, 1)   # table stretches
+    splitter.setStretchFactor(1, 0)   # log stays compact
+    splitter.setSizes([400, 100])
 
-    # --- Bottom bar: checkbox + close button ---
+    # --- Bottom bar: checkboxes + close button ---
     bg_checkbox = QCheckBox("Hintergrund-Modus")
     bg_checkbox.setChecked(True)
     bg_checkbox.setToolTip("Aktiviert: Schließen versteckt das Fenster in den Tray\n"
                            "Deaktiviert: Schließen beendet das Programm")
+
+    autoscroll_checkbox = QCheckBox("Auto-Scroll")
+    autoscroll_checkbox.setChecked(True)
+    autoscroll_checkbox.setToolTip("Automatisch zum Ende des Event-Logs scrollen")
 
     close_btn = QPushButton("Schließen")
     close_btn.setFixedWidth(120)
 
     bottom_bar = QHBoxLayout()
     bottom_bar.addWidget(bg_checkbox)
+    bottom_bar.addWidget(autoscroll_checkbox)
     bottom_bar.addStretch()
     bottom_bar.addWidget(close_btn)
 
@@ -454,20 +467,23 @@ def run_gui():
                 break
 
             if kind == "devices":
-                table.setRowCount(len(data))
+                padding = 5
+                table.setRowCount(len(data) + padding)
                 for row_idx, row_data in enumerate(data):
                     for col_idx, value in enumerate(row_data):
                         item = QTableWidgetItem(value)
                         item.setFlags(item.flags() & ~(Qt.ItemFlag.ItemIsEditable if QT6
                                                         else Qt.ItemIsEditable))
                         table.setItem(row_idx, col_idx, item)
+                for row_idx in range(len(data), len(data) + padding):
+                    for col_idx in range(table.columnCount()):
+                        item = QTableWidgetItem("")
+                        item.setFlags(item.flags() & ~(Qt.ItemFlag.ItemIsEditable if QT6
+                                                        else Qt.ItemIsEditable))
+                        table.setItem(row_idx, col_idx, item)
 
             elif kind == "log":
-                log_edit.moveCursor(QTextCursor.MoveOperation.End if QT6
-                                    else QTextCursor.End)
                 log_edit.appendPlainText(data)
-                log_edit.moveCursor(QTextCursor.MoveOperation.End if QT6
-                                    else QTextCursor.End)
 
     timer = QTimer()
     timer.timeout.connect(process_queue)
